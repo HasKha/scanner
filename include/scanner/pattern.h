@@ -163,7 +163,7 @@ struct FuncEntry : Step {
     constexpr FuncEntry() : Step{StepKind::FuncEntry} {}
 };
 
-// A pattern and its steps. A site lands when every step can be taken.
+// A pattern and its steps. A site lands when every step can be taken, and they leave it inside the image.
 struct PatternScan {
     Pattern pattern;
     std::array<Step, MAX_STEPS> steps{};

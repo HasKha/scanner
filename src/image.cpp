@@ -95,22 +95,33 @@ std::wstring moduleFileName(HMODULE module) {
 
 std::string hex(uint64_t value) { return std::format("0x{:X}", value); }
 
+// A path as UTF-8, for a message: path::string() throws on a character outside the ANSI code page.
+std::string pathText(const std::filesystem::path& path) {
+    const std::wstring& wide = path.native();
+    const int size = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(), nullptr, 0, nullptr, nullptr);
+    std::string text(size > 0 ? (size_t)size : 0, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(), text.data(), size, nullptr, nullptr);
+    return text;
+}
+
 } // namespace
 
 void Image::Unmap::operator()(const void* view) const { UnmapViewOfFile(view); }
 
-std::optional<Image> Image::openFile(const std::filesystem::path& path, std::string& why, uintptr_t live_base) {
+std::optional<Image> Image::openFile(const std::filesystem::path& path, std::string& why) {
     // ---- The file, mapped read-only: its pages are the file's, and nothing is copied
     const Handle file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
     LARGE_INTEGER file_size{};
     if (file.handle == INVALID_HANDLE_VALUE || !GetFileSizeEx(file.handle, &file_size) || file_size.QuadPart == 0) {
-        why = std::format("cannot read {}, error {}", path.string(), GetLastError());
+        const DWORD error = GetLastError();
+        why = std::format("cannot read {}, error {}", pathText(path), error);
         return std::nullopt;
     }
     const Handle mapping{CreateFileMappingW(file.handle, nullptr, PAGE_READONLY, 0, 0, nullptr)};
     const void* mapped = mapping.handle != nullptr ? MapViewOfFile(mapping.handle, FILE_MAP_READ, 0, 0, 0) : nullptr;
     if (mapped == nullptr) {
-        why = std::format("cannot map {}, error {}", path.string(), GetLastError());
+        const DWORD error = GetLastError();
+        why = std::format("cannot map {}, error {}", pathText(path), error);
         return std::nullopt;
     }
     Image image;
@@ -120,55 +131,26 @@ std::optional<Image> Image::openFile(const std::filesystem::path& path, std::str
 
     const std::optional<Headers> headers = readHeaders(start, size, why);
     if (!headers) {
-        why = path.string() + " is " + why;
+        why = pathText(path) + " is " + why;
         return std::nullopt;
     }
     image.image_size = headers->image_size;
     image.preferred_base = headers->image_base;
-    image.live_base = live_base != 0 ? live_base : (uintptr_t)headers->image_base;
-    image.has_live = live_base != 0;
+    image.live_base = (uintptr_t)headers->image_base;
 
     // ---- The sections, the headers first as one of their own
-    image.sections.push_back({0, headers->headers_size, std::min<uint32_t>(headers->headers_size, (uint32_t)std::min<size_t>(size, UINT32_MAX)), start, false});
+    image.regions.push_back({0, headers->headers_size, std::min<uint32_t>(headers->headers_size, (uint32_t)std::min<size_t>(size, UINT32_MAX)), start, false, false});
     for (WORD i = 0; i < headers->file->NumberOfSections; ++i) {
         const IMAGE_SECTION_HEADER& header = headers->sections[i];
         // Zero from a linker that leaves the raw size to say it.
         const uint32_t virtual_size = header.Misc.VirtualSize != 0 ? header.Misc.VirtualSize : header.SizeOfRawData;
         const uint32_t held = std::min<uint32_t>(header.SizeOfRawData, virtual_size);
         if ((uint64_t)header.PointerToRawData + held > size || (uint64_t)header.VirtualAddress + virtual_size > image.image_size) {
-            why = std::format("{} is cut short: section {} lies past its end", path.string(), i);
+            why = std::format("{} is cut short: section {} lies past its end", pathText(path), i);
             return std::nullopt;
         }
-        image.sections.push_back({header.VirtualAddress, virtual_size, held, start + header.PointerToRawData,
-                                  (header.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0});
-    }
-
-    // ---- What the loader relocates
-    if (headers->directory_count > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
-        const IMAGE_DATA_DIRECTORY& directory = headers->directories[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        const uint8_t* block = image.fileBytes(directory.VirtualAddress, directory.Size);
-        const uint8_t* const end = block != nullptr ? block + directory.Size : nullptr;
-        while (block != nullptr && block + sizeof(IMAGE_BASE_RELOCATION) <= end) {
-            const auto* relocation = (const IMAGE_BASE_RELOCATION*)block;
-            const size_t block_size = relocation->SizeOfBlock;
-            if (block_size < sizeof(IMAGE_BASE_RELOCATION) || block + block_size > end) {
-                block = nullptr;
-            } else {
-                const auto* entry = (const WORD*)(block + sizeof(IMAGE_BASE_RELOCATION));
-                const auto* const entries_end = (const WORD*)(block + block_size);
-                for (; entry < entries_end; ++entry) {
-                    const int type = *entry >> 12;
-                    const uint32_t rva = relocation->VirtualAddress + (*entry & 0xFFF);
-                    if (type == IMAGE_REL_BASED_DIR64) {
-                        image.relocations.push_back({rva, 8});
-                    } else if (type == IMAGE_REL_BASED_HIGHLOW) {
-                        image.relocations.push_back({rva, 4});
-                    }
-                }
-                block += block_size;
-            }
-        }
-        std::ranges::sort(image.relocations, {}, &Relocation::rva);
+        image.regions.push_back({header.VirtualAddress, virtual_size, held, start + header.PointerToRawData,
+                                 (header.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0, (header.Characteristics & IMAGE_SCN_MEM_WRITE) != 0});
     }
 
     // ---- The unwind table, for FuncEntry()
@@ -184,29 +166,30 @@ std::optional<Image> Image::openFile(const std::filesystem::path& path, std::str
 std::optional<Image> Image::openRunning(std::string& why) {
     const HMODULE module = GetModuleHandleW(nullptr);
     const std::wstring path = moduleFileName(module);
-    std::optional<Image> image = openFile(path, why, (uintptr_t)module);
+    std::optional<Image> image = openFile(path, why);
     if (!image) {
         return std::nullopt;
     }
+    image->live_base = (uintptr_t)module;
 
     // The file is the one the process was started from while the headers the loader keeps agree with it: a client
     // updated on disk while it runs does not.
     std::string unused;
-    const Section& headers = image->sections.front();
+    const Section& headers = image->headers();
     const std::optional<Headers> live = readHeaders((const uint8_t*)module, headers.virtual_size, unused);
     const std::optional<Headers> file = readHeaders(headers.bytes, headers.file_size, unused);
     const bool same = live && file && live->file->TimeDateStamp == file->file->TimeDateStamp &&
                       live->file->NumberOfSections == file->file->NumberOfSections && live->image_size == file->image_size &&
                       live->checksum == file->checksum && live->entry_point == file->entry_point;
     if (!same) {
-        why = std::filesystem::path(path).string() + " is not the file this process was started from: their headers differ";
+        why = pathText(path) + " is not the file this process was started from: their headers differ";
         return std::nullopt;
     }
     return image;
 }
 
 const uint8_t* Image::fileBytes(int64_t rva, size_t count) const {
-    for (const Section& section : sections) {
+    for (const Section& section : regions) {
         if (rva >= section.rva && (uint64_t)(rva - section.rva) + count <= section.file_size) {
             return section.bytes + (rva - section.rva);
         }
@@ -223,7 +206,7 @@ void Image::visitSites(const Pattern& pattern, Visit visit) const {
     }
     const bool any_named = first_named < pattern.size();
     bool stopped = !pattern.valid();
-    for (const Section& section : sections) {
+    for (const Section& section : regions) {
         const bool holds_sites = section.code && section.file_size >= pattern.size();
         const uint8_t* const last_site = holds_sites ? section.bytes + (section.file_size - pattern.size()) : nullptr;
         const uint8_t* site = section.bytes;
@@ -368,6 +351,13 @@ Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) co
         }
         }
     }
+    // Where the steps leave it is an answer only inside the image: an Offset() needs no read to go past it.
+    if (passed && (at < 0 || (uint64_t)at >= image_size)) {
+        passed = false;
+        if (explain) {
+            walk.rejected = "the steps land at " + describe(at) + ", outside the image";
+        }
+    }
     if (passed) {
         walk.landed = at;
     }
@@ -377,6 +367,14 @@ Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) co
 std::string Image::describe(int64_t rva) const { return hex(preferred_base + rva); }
 
 void* Image::scan(const PatternScan& scan) const {
+    __try {
+        return firstLanding(scan);
+    } __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return nullptr;
+    }
+}
+
+void* Image::firstLanding(const PatternScan& scan) const {
     void* landed = nullptr;
     visitSites(scan.pattern, [&](uint32_t site) {
         const Walk walked = walk(scan, site, false);
@@ -415,58 +413,13 @@ std::vector<uintptr_t> Image::findPattern(const Pattern& pattern) const {
     return sites;
 }
 
-std::optional<std::vector<Image::Change>> Image::findLiveChanges(const void* at, size_t size) const {
-    const auto live = (uintptr_t)at;
-    const uint8_t* file = has_live && contains(live, size) ? fileBytes((int64_t)(live - live_base), size) : nullptr;
-    if (file == nullptr) {
-        return std::nullopt;
-    }
-    const auto rva = (uint32_t)(live - live_base);
-
-    // ---- The bytes the loader would leave there: the file's, with every address in the range relocated
-    std::vector<uint8_t> expected(file, file + size);
-    const uint64_t delta = (uint64_t)live_base - preferred_base;
-    constexpr uint32_t WIDEST = 8;
-    auto relocation = std::ranges::lower_bound(relocations, rva >= WIDEST ? rva - WIDEST : 0, {}, &Relocation::rva);
-    for (; relocation != relocations.end() && relocation->rva < rva + size; ++relocation) {
-        const uint8_t* value_bytes = fileBytes(relocation->rva, relocation->width);
-        if (value_bytes != nullptr && relocation->rva + relocation->width > rva) {
-            uint64_t value = 0;
-            std::memcpy(&value, value_bytes, relocation->width);
-            value += delta;
-            uint8_t relocated[WIDEST];
-            std::memcpy(relocated, &value, sizeof(relocated));
-            for (uint32_t i = 0; i < relocation->width; ++i) {
-                const int64_t offset = (int64_t)relocation->rva + i - rva;
-                if (offset >= 0 && (uint64_t)offset < size) {
-                    expected[(size_t)offset] = relocated[i];
-                }
-            }
-        }
-    }
-
-    // ---- The runs that differ
-    std::vector<Change> changes;
-    const auto* bytes = (const uint8_t*)at;
-    for (size_t i = 0; i < size; ++i) {
-        if (bytes[i] != expected[i]) {
-            if (!changes.empty() && changes.back().at + changes.back().size == live + i) {
-                ++changes.back().size;
-            } else {
-                changes.push_back({live + i, 1});
-            }
-        }
-    }
-    return changes;
-}
-
 bool Image::contains(uintptr_t live, size_t count) const {
     return live >= live_base && live - live_base <= image_size && count <= image_size - (live - live_base);
 }
 
 bool Image::isCode(uintptr_t live) const {
     const uintptr_t rva = live - live_base;
-    return contains(live) && std::ranges::any_of(sections, [rva](const Section& section) {
+    return contains(live) && std::ranges::any_of(sections(), [rva](const Section& section) {
                return section.code && rva >= section.rva && rva < (uintptr_t)section.rva + section.virtual_size;
            });
 }

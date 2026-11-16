@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -18,11 +19,13 @@ namespace scanner {
 // - **Only the executable is scanned.** Another module's code is never looked at, nor a page of it that the module's
 //   unloading takes away mid-scan.
 // - **What another module did to the executable's code is not seen.** A detour over a function's entry leaves its pattern
-//   matching, and findLiveChanges() is how to ask what was done.
+//   matching.
 // - **The file on disk is scanned exactly as the running image is**, so a pattern is checked with the program shut, at
 //   the addresses a disassembler shows.
 //
-// Every read a step makes is bounded by the file: a step that would read past it rejects the site rather than fault.
+// Every read a step makes is bounded by the file: a step that would read past it rejects the site rather than fault. A
+// page of the mapping the system cannot read in, from a drive gone or a file changed under it, is a miss for scan(),
+// which the program scans with; scanAll() and findPattern(), for checking a pattern, let the fault through to the caller.
 // Nothing is specific to any one program. A const Image is safe to use from any thread.
 class Image {
 public:
@@ -30,10 +33,9 @@ public:
     // their headers, and a scan's answer is an address in that image.
     static std::optional<Image> openRunning(std::string& why);
 
-    // An executable on disk. A scan's answer is an address as if it were loaded at `live_base`, by default the address
-    // it asks to be loaded at, which is what a disassembler shows. Given a `live_base`, that is where a copy laid out by
-    // section really is, for findLiveChanges() to read.
-    static std::optional<Image> openFile(const std::filesystem::path& path, std::string& why, uintptr_t live_base = 0);
+    // An executable on disk. A scan's answer is an address as if it were loaded where it asks to be, which is what a
+    // disassembler shows.
+    static std::optional<Image> openFile(const std::filesystem::path& path, std::string& why);
 
     // ---- Scanning
 
@@ -60,24 +62,22 @@ public:
     // Every place in the code the pattern alone matches, lowest first.
     std::vector<uintptr_t> findPattern(const Pattern& pattern) const;
 
-    // ---- What was done to the running image
-
-    // A run of live bytes that the file does not hold.
-    struct Change {
-        uintptr_t at = 0;
-        size_t size = 0;
-    };
-    // The bytes from `at` that differ in the live image from the file, as runs: a detour over an entry is one run of
-    // five bytes there. An address the image relocates is compared as relocated. **Meaningful for code and constant
-    // data**: the image's own writes, and the import table the loader fills, are changes too. Nullopt when the bytes
-    // are not all in the file, or there is no live image to read, which an Image opened by file without a `live_base`
-    // does not have.
-    //
-    // Which change matters is the caller's to say. A detour another addon put over a function's entry is what a hook
-    // chains through, where an instruction rewritten in the middle of code read for a rel32 is not.
-    std::optional<std::vector<Change>> findLiveChanges(const void* at, size_t size) const;
-
     // ---- Where things are
+
+    // A part of the image, and the bytes the file holds of it.
+    struct Section {
+        uint32_t rva = 0;
+        uint32_t virtual_size = 0;
+        // The bytes the file holds of it, from `rva`: past them, the image is zeroes the file does not hold.
+        uint32_t file_size = 0;
+        const uint8_t* bytes = nullptr;
+        bool code = false;
+        bool writable = false;
+    };
+    // The headers, as the file holds them, at rva 0.
+    const Section& headers() const { return regions.front(); }
+    // The file's sections, in its order.
+    std::span<const Section> sections() const { return std::span(regions).subspan(1); }
 
     uintptr_t liveBase() const { return live_base; }
     size_t size() const { return image_size; }
@@ -88,20 +88,6 @@ public:
 
 private:
     Image() = default;
-
-    struct Section {
-        uint32_t rva = 0;
-        uint32_t virtual_size = 0;
-        // The bytes the file holds of it, from `rva`: past them, the image is zeroes the file does not hold.
-        uint32_t file_size = 0;
-        const uint8_t* bytes = nullptr;
-        bool code = false;
-    };
-
-    struct Relocation {
-        uint32_t rva = 0;
-        uint8_t width = 0;
-    };
 
     struct Walk {
         std::optional<int64_t> landed;
@@ -115,6 +101,8 @@ private:
     void visitSites(const Pattern& pattern, Visit visit) const;
     // `explain`: whether to say why a site is rejected, which only scanAll() wants.
     Walk walk(const PatternScan& scan, uint32_t site, bool explain) const;
+    // scan(), unguarded: __try needs a frame of its own, with no objects to destroy.
+    void* firstLanding(const PatternScan& scan) const;
     std::string describe(int64_t rva) const;
 
     struct Unmap {
@@ -124,10 +112,8 @@ private:
     size_t image_size = 0;
     uint64_t preferred_base = 0;
     uintptr_t live_base = 0;
-    bool has_live = false;
-    std::vector<Section> sections;
-    // The rva of every address the loader relocates, ascending.
-    std::vector<Relocation> relocations;
+    // The headers, then the file's sections.
+    std::vector<Section> regions;
     // The unwind table's entries, ascending, x64 only: three uint32 each, a function's start, end and unwind data.
     const uint32_t* functions = nullptr;
     size_t function_count = 0;

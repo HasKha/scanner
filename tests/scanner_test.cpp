@@ -151,9 +151,9 @@ const std::filesystem::path& exePath() {
     return path;
 }
 
-Image openExe(uintptr_t live_base = 0) {
+Image openExe() {
     std::string why;
-    std::optional<Image> image = Image::openFile(exePath(), why, live_base);
+    std::optional<Image> image = Image::openFile(exePath(), why);
     INFO(why);
     REQUIRE(image.has_value());
     return std::move(*image);
@@ -163,11 +163,6 @@ uintptr_t at(uint32_t rva) { return (uintptr_t)(IMAGE_BASE + rva); }
 
 // Never called: only its bytes are looked for.
 __declspec(noinline) int distinctiveFunction(int value) { return value * 0x5EED + 0x0DDBA11; }
-
-struct Polymorphic {
-    virtual ~Polymorphic() = default;
-    virtual int value() const { return 7; }
-};
 
 } // namespace
 
@@ -237,6 +232,14 @@ TEST_CASE("a scan lands where memtools lands") {
         REQUIRE(jumps.size() == 1);
         CHECK(jumps[0].rejected.find("points outside the image") != std::string::npos);
     }
+    SECTION("steps that leave the image land nowhere") {
+        // From 0x1000 and 0x1080: past the image's end, and before its start.
+        CHECK(image.scan(PatternScan("48 8D 0D", Offset(IMAGE_SIZE))) == nullptr);
+        const std::vector<Image::Site> sites = image.scanAll(PatternScan("48 8D 0D", Offset(-0x1001)));
+        REQUIRE(sites.size() == 2);
+        CHECK(sites[0].rejected.find("outside the image") != std::string::npos);
+        CHECK(sites[1].landed == at(0x7F));
+    }
     SECTION("the function a site is in") {
         CHECK(image.scan(PatternScan("B8 78 56 34 12", FuncEntry())) == (void*)at(0x1040));
         CHECK(image.scan(PatternScan("90 90 C3", FuncEntry())) == nullptr);
@@ -252,50 +255,21 @@ TEST_CASE("a scan lands where memtools lands") {
         CHECK(image.scan(PatternScan(not_hex.c_str())) == nullptr);
     }
     SECTION("where things are") {
+        CHECK(image.headers().rva == 0);
+        CHECK(image.headers().file_size == HEADERS_SIZE);
+        REQUIRE(image.sections().size() == SECTION_COUNT);
+        CHECK(image.sections()[0].code);
+        CHECK_FALSE(image.sections()[0].writable);
+        CHECK(image.sections()[2].writable);
+        // .data: the image holds more of it than the file.
+        CHECK(image.sections()[2].virtual_size == 0x1000);
+        CHECK(image.sections()[2].file_size == RAW_SECTION_SIZE);
         CHECK(image.isCode(at(0x1040)));
         CHECK_FALSE(image.isCode(at(0x2010)));
         CHECK(image.contains(at(0x5FFF)));
         CHECK_FALSE(image.contains(at(0x5FFF), 2));
         CHECK(image.preferredAddress(at(0x1234)) == IMAGE_BASE + 0x1234);
     }
-}
-
-TEST_CASE("what was done to the live image is told apart from the file") {
-    // The image as a loader leaves it, somewhere else than it asks for.
-    const std::vector<uint8_t> file = buildExe();
-    std::vector<uint8_t> live(IMAGE_SIZE);
-    std::memcpy(live.data(), file.data(), HEADERS_SIZE);
-    for (uint32_t i = 0; i < SECTION_COUNT; ++i) {
-        std::memcpy(live.data() + SECTIONS[i].rva, file.data() + HEADERS_SIZE + i * RAW_SECTION_SIZE, std::min(RAW_SECTION_SIZE, SECTIONS[i].virtual_size));
-    }
-    const uint64_t relocated = (uint64_t)live.data() + 0x1040;
-    std::memcpy(live.data() + 0x2080, &relocated, sizeof(relocated));
-    const Image image = openExe((uintptr_t)live.data());
-
-    CHECK(image.findLiveChanges(live.data() + 0x1000, 0x100)->empty());
-    // The relocated address, and a range starting inside it.
-    CHECK(image.findLiveChanges(live.data() + 0x2078, 0x10)->empty());
-    CHECK(image.findLiveChanges(live.data() + 0x2084, 0x4)->empty());
-
-    // A detour over an entry.
-    const uint8_t detour[] = {0xE9, 0x11, 0x22, 0x33, 0x44};
-    std::memcpy(live.data() + 0x1040, detour, sizeof(detour));
-    const std::vector<Image::Change> changes = *image.findLiveChanges(live.data() + 0x1000, 0x100);
-    REQUIRE(changes.size() == 1);
-    CHECK(changes[0].at == (uintptr_t)live.data() + 0x1040);
-    CHECK(changes[0].size == sizeof(detour));
-    // The scans read the file, so it is still found.
-    CHECK(image.scan(PatternScan("48 83 EC 28 B8")) == live.data() + 0x1040);
-
-    // An address left as the file holds it is a change once relocated.
-    const uint64_t unrelocated = IMAGE_BASE + 0x1040;
-    std::memcpy(live.data() + 0x2080, &unrelocated, sizeof(unrelocated));
-    CHECK_FALSE(image.findLiveChanges(live.data() + 0x2080, 8)->empty());
-
-    // Nothing to compare: zeroes the file does not hold, outside the image, no live image.
-    CHECK_FALSE(image.findLiveChanges(live.data() + 0x3800, 4).has_value());
-    CHECK_FALSE(image.findLiveChanges(live.data() + IMAGE_SIZE - 2, 4).has_value());
-    CHECK_FALSE(openExe().findLiveChanges((const void*)at(0x1000), 4).has_value());
 }
 
 TEST_CASE("the running executable is its own file") {
@@ -317,10 +291,4 @@ TEST_CASE("the running executable is its own file") {
     const std::vector<uintptr_t> sites = image->findPattern(text.c_str());
     CHECK(std::ranges::find(sites, (uintptr_t)function) != sites.end());
     CHECK(image->isCode((uintptr_t)function));
-    CHECK(image->findLiveChanges(function, BYTES_LOOKED_FOR)->empty());
-
-    // A vtable holds addresses the loader relocated.
-    const Polymorphic object;
-    const void* vtable = *(const void* const*)&object;
-    CHECK(image->findLiveChanges(vtable, 2 * sizeof(void*))->empty());
 }
