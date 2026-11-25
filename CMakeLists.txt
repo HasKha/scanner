@@ -5,7 +5,9 @@ project(scanner CXX)
 add_library(scanner STATIC
     "include/scanner/pattern.h"
     "include/scanner/image.h"
+    "include/scanner/thread_local.h"
     "src/image.cpp"
+    "src/thread_local.cpp"
 )
 target_include_directories(scanner PUBLIC "include/")
 target_compile_features(scanner PUBLIC cxx_std_20)

@@ -33,6 +33,10 @@ public:
     // their headers, and a scan's answer is an address in that image.
     static std::optional<Image> openRunning(std::string& why);
 
+    // openRunning(), once for the whole process and kept to its end: the mapping every scan of the process can share.
+    // Null when it could not be opened, and `why`, when given, says why. Safe from any thread.
+    static const Image* running(std::string* why = nullptr);
+
     // An executable on disk. A scan's answer is an address as if it were loaded where it asks to be, which is what a
     // disassembler shows.
     static std::optional<Image> openFile(const std::filesystem::path& path, std::string& why);
@@ -85,6 +89,9 @@ public:
     bool isCode(uintptr_t live) const;
     // What a disassembler shows for `live`: the address the file asks to be loaded at, plus its offset in the image.
     uint64_t preferredAddress(uintptr_t live) const { return preferred_base + (live - live_base); }
+    // Where the loader keeps the executable's TLS index, `_tls_index`, which names its block in each thread's TLS array:
+    // the TLS directory's AddressOfIndex. Zero when it has no thread-locals. x64 only.
+    uintptr_t tlsIndexAddress() const { return tls_index_rva != 0 ? live_base + tls_index_rva : 0; }
 
 private:
     Image() = default;
@@ -117,6 +124,7 @@ private:
     // The unwind table's entries, ascending, x64 only: three uint32 each, a function's start, end and unwind data.
     const uint32_t* functions = nullptr;
     size_t function_count = 0;
+    uint32_t tls_index_rva = 0;
 };
 
 } // namespace scanner

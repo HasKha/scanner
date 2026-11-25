@@ -160,6 +160,19 @@ std::optional<Image> Image::openFile(const std::filesystem::path& path, std::str
         image.functions = (const uint32_t*)image.fileBytes(directory.VirtualAddress, directory.Size);
         image.function_count = image.functions != nullptr ? directory.Size / ENTRY_SIZE : 0;
     }
+
+    // ---- The TLS directory, for where the loader keeps the executable's TLS index
+    if (headers->file->Machine == IMAGE_FILE_MACHINE_AMD64 && headers->directory_count > IMAGE_DIRECTORY_ENTRY_TLS) {
+        const IMAGE_DATA_DIRECTORY& directory = headers->directories[IMAGE_DIRECTORY_ENTRY_TLS];
+        const auto* tls = directory.Size >= sizeof(IMAGE_TLS_DIRECTORY64)
+                              ? (const IMAGE_TLS_DIRECTORY64*)image.fileBytes(directory.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64))
+                              : nullptr;
+        // A VA, as the file asks to be loaded.
+        if (tls != nullptr && tls->AddressOfIndex > image.preferred_base &&
+            tls->AddressOfIndex - image.preferred_base + sizeof(uint32_t) <= image.image_size) {
+            image.tls_index_rva = (uint32_t)(tls->AddressOfIndex - image.preferred_base);
+        }
+    }
     return image;
 }
 
@@ -186,6 +199,22 @@ std::optional<Image> Image::openRunning(std::string& why) {
         return std::nullopt;
     }
     return image;
+}
+
+const Image* Image::running(std::string* why) {
+    struct Opened {
+        std::optional<Image> image;
+        std::string why;
+    };
+    static const Opened opened = [] {
+        Opened result;
+        result.image = openRunning(result.why);
+        return result;
+    }();
+    if (why != nullptr) {
+        *why = opened.why;
+    }
+    return opened.image ? &*opened.image : nullptr;
 }
 
 const uint8_t* Image::fileBytes(int64_t rva, size_t count) const {

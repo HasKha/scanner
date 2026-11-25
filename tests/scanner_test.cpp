@@ -291,4 +291,12 @@ TEST_CASE("the running executable is its own file") {
     const std::vector<uintptr_t> sites = image->findPattern(text.c_str());
     CHECK(std::ranges::find(sites, (uintptr_t)function) != sites.end());
     CHECK(image->isCode((uintptr_t)function));
+
+    // Opened once, by whichever call comes first.
+    std::string running_why;
+    const Image* running = Image::running(&running_why);
+    INFO(running_why);
+    REQUIRE(running != nullptr);
+    CHECK(running == Image::running());
+    CHECK(running->liveBase() == image->liveBase());
 }
