@@ -45,6 +45,7 @@ public:
 
     // Where `scan` lands from its lowest site whose steps can all be taken. Null when none can.
     void* scan(const PatternScan& scan) const;
+    void* scan(const StringScan& scan) const;
     // The first of the scans that lands anywhere, where it lands.
     void* scan(const FallbackScan& scans) const;
 
@@ -53,15 +54,17 @@ public:
         return (T)scan(scans);
     }
 
-    // A site of a pattern, and where its steps took it. For checking a pattern, in full.
+    // A site of a scan, and where its steps took it. For checking a pattern, in full.
     struct Site {
         uintptr_t match = 0;
         // Zero when a step could not be taken, and `rejected` says which and why.
         uintptr_t landed = 0;
         std::string rejected;
     };
-    // Every site `scan`'s pattern matches, lowest first: scan() takes the first that landed.
+    // Every site `scan`'s pattern matches, or every reference to its text, lowest first: scan() takes the first that
+    // landed.
     std::vector<Site> scanAll(const PatternScan& scan) const;
+    std::vector<Site> scanAll(const StringScan& scan) const;
 
     // Every place in the code the pattern alone matches, lowest first.
     std::vector<uintptr_t> findPattern(const Pattern& pattern) const;
@@ -106,10 +109,17 @@ private:
     // Calls `visit` at each site of `pattern` in the code, lowest first, until it returns true.
     template <typename Visit>
     void visitSites(const Pattern& pattern, Visit visit) const;
-    // `explain`: whether to say why a site is rejected, which only scanAll() wants.
-    Walk walk(const PatternScan& scan, uint32_t site, bool explain) const;
+    // Calls `visit` at each rel32 in the code that points at `scan`'s text, lowest first, until it returns true.
+    template <typename Visit>
+    void visitSites(const StringScan& scan, Visit visit) const;
+    // `pattern`: what AdvWcard() counts in, none for a StringScan. `explain`: whether to say why a site is rejected,
+    // which only scanAll() wants.
+    Walk walk(const Pattern& pattern, std::span<const Step> steps, uint32_t site, bool explain) const;
     // scan(), unguarded: __try needs a frame of its own, with no objects to destroy.
-    void* firstLanding(const PatternScan& scan) const;
+    template <typename Scan>
+    void* firstLanding(const Scan& scan) const;
+    template <typename Scan>
+    std::vector<Site> allSites(const Scan& scan) const;
     std::string describe(int64_t rva) const;
 
     struct Unmap {

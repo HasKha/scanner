@@ -172,6 +172,34 @@ struct PatternScan {
     }
 };
 
+// Text the code refers to, and the steps from where it is referred to: what a pattern cannot be written for that will
+// outlast a patch, as what the program asserts or logs rarely changes. Every rel32 in the code that points at the text,
+// its terminator included, is a site: the steps start on the rel32, so `Offset(-3)` is the start of a
+// `LEA reg,[rip+text]` and FuncEntry() the function that uses it. There is no pattern, so AdvWcard() stays where it is.
+//
+// Every rel32 is any four bytes of the code, so four that are not an operand point at the text by chance once in 2^32:
+// a step that proves the site, as a CmpI8() of the instruction before it, is worth it where a wrong one would hurt.
+struct StringScan {
+    const char* text = nullptr;
+    const wchar_t* wide_text = nullptr;
+    std::array<Step, MAX_STEPS> steps{};
+    size_t step_count = 0;
+
+    template <typename... Steps>
+    constexpr StringScan(const char* scan_text, Steps... scan_steps)
+        : text(scan_text), steps{static_cast<const Step&>(scan_steps)...}, step_count(sizeof...(Steps)) {
+        static_assert(sizeof...(Steps) <= MAX_STEPS, "a StringScan takes at most MAX_STEPS steps");
+        static_assert((std::is_base_of_v<Step, Steps> && ...), "a step is one of scanner's");
+    }
+    // UTF-16 text.
+    template <typename... Steps>
+    constexpr StringScan(const wchar_t* scan_text, Steps... scan_steps)
+        : wide_text(scan_text), steps{static_cast<const Step&>(scan_steps)...}, step_count(sizeof...(Steps)) {
+        static_assert(sizeof...(Steps) <= MAX_STEPS, "a StringScan takes at most MAX_STEPS steps");
+        static_assert((std::is_base_of_v<Step, Steps> && ...), "a step is one of scanner's");
+    }
+};
+
 // Scans tried in turn: the first to land anywhere is the answer. It holds the scans themselves, which must outlive it.
 struct FallbackScan {
     std::vector<const PatternScan*> scans;

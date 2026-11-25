@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cwchar>
 #include <format>
+#include <functional>
 
 namespace scanner {
 
@@ -94,6 +95,28 @@ std::wstring moduleFileName(HMODULE module) {
 }
 
 std::string hex(uint64_t value) { return std::format("0x{:X}", value); }
+
+// Where each kind of scan finds its sites: a pattern's matches, or the references to a string's text.
+const Pattern& sitesOf(const PatternScan& scan) { return scan.pattern; }
+const StringScan& sitesOf(const StringScan& scan) { return scan; }
+
+// What AdvWcard() counts in: a StringScan has no pattern.
+constexpr Pattern NO_PATTERN;
+const Pattern& patternOf(const PatternScan& scan) { return scan.pattern; }
+const Pattern& patternOf(const StringScan&) { return NO_PATTERN; }
+
+template <typename Scan>
+std::span<const Step> stepsOf(const Scan& scan) {
+    return std::span(scan.steps.data(), scan.step_count);
+}
+
+// A StringScan's text as the file holds it, its terminator included.
+std::span<const uint8_t> textOf(const StringScan& scan) {
+    if (scan.wide_text != nullptr) {
+        return std::span((const uint8_t*)scan.wide_text, (std::wcslen(scan.wide_text) + 1) * sizeof(wchar_t));
+    }
+    return scan.text != nullptr ? std::span((const uint8_t*)scan.text, std::strlen(scan.text) + 1) : std::span<const uint8_t>();
+}
 
 // A path as UTF-8, for a message: path::string() throws on a character outside the ANSI code page.
 std::string pathText(const std::filesystem::path& path) {
@@ -252,7 +275,66 @@ void Image::visitSites(const Pattern& pattern, Visit visit) const {
     }
 }
 
-Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) const {
+template <typename Visit>
+void Image::visitSites(const StringScan& scan, Visit visit) const {
+    const std::span<const uint8_t> text = textOf(scan);
+    const size_t terminator_size = scan.wide_text != nullptr ? sizeof(wchar_t) : 1;
+    if (text.size() <= terminator_size) {
+        return;
+    }
+    // Every copy of the text, in the sections that are not code.
+    std::vector<int64_t> copies;
+    const std::boyer_moore_horspool_searcher searcher(text.begin(), text.end());
+    for (const Section& section : sections()) {
+        const uint8_t* const end = section.bytes + section.file_size;
+        for (const uint8_t* found = section.code ? end : std::search(section.bytes, end, searcher); found != end;
+             found = std::search(found + 1, end, searcher)) {
+            copies.push_back(section.rva + (found - section.bytes));
+        }
+    }
+    if (copies.empty()) {
+        return;
+    }
+
+    // Every rel32 in the code that points at one. Nothing says where operands start, so every byte could, but the rel32
+    // a byte needs to point at a copy is one less at each byte after it: its third byte is the same across a stretch of
+    // up to 64 KiB, and memchr() skips to where the code holds it, as visitSites() does for a pattern's first byte.
+    std::vector<uint32_t> references;
+    for (const Section& section : sections()) {
+        const size_t sites = section.code && section.file_size >= sizeof(int32_t) ? section.file_size - sizeof(int32_t) + 1 : 0;
+        for (const int64_t copy : copies) {
+            size_t offset = 0;
+            while (offset < sites) {
+                // What the rel32 at `offset` must hold, as its bits.
+                const auto needed = (uint32_t)(copy - ((int64_t)section.rva + (int64_t)offset + (int64_t)sizeof(int32_t)));
+                // The bytes from `offset` to `stretch_end` need the same third byte: each needs one less than the last.
+                const size_t stretch_end = std::min<size_t>(offset + (needed & 0xFFFF) + 1, sites);
+                const auto third = (uint8_t)(needed >> 16);
+                const uint8_t* from = section.bytes + offset + 2;
+                const uint8_t* const to = section.bytes + stretch_end + 2;
+                while (from < to) {
+                    const auto* found = (const uint8_t*)std::memchr(from, third, to - from);
+                    if (found == nullptr) {
+                        break;
+                    }
+                    const size_t site = (size_t)(found - section.bytes) - 2;
+                    int32_t displacement = 0;
+                    std::memcpy(&displacement, section.bytes + site, sizeof(displacement));
+                    if ((int64_t)section.rva + (int64_t)site + (int64_t)sizeof(int32_t) + displacement == copy) {
+                        references.push_back(section.rva + (uint32_t)site);
+                    }
+                    from = found + 1;
+                }
+                offset = stretch_end;
+            }
+        }
+    }
+    std::ranges::sort(references);
+    for (size_t i = 0; i < references.size() && !visit(references[i]); ++i) {
+    }
+}
+
+Image::Walk Image::walk(const Pattern& pattern, std::span<const Step> steps, uint32_t site, bool explain) const {
     Walk walk;
     int64_t at = site;
     int64_t offset_from_match = 0;
@@ -290,8 +372,8 @@ Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) co
     };
 
     bool passed = true;
-    for (size_t i = 0; i < scan.step_count && passed; ++i) {
-        const Step& step = scan.steps[i];
+    for (size_t i = 0; i < steps.size() && passed; ++i) {
+        const Step& step = steps[i];
         switch (step.kind) {
         case StepKind::Offset:
             offset_from_match += step.value;
@@ -334,13 +416,13 @@ Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) co
             }
             break;
         case StepKind::AdvWcard: {
-            const auto size = (int64_t)scan.pattern.size();
+            const auto size = (int64_t)pattern.size();
             passed = offset_from_match >= 0 && offset_from_match <= size;
             for (int64_t set = 0; set < step.value && passed; ++set) {
-                bool was_at_wildcard = offset_from_match < size && scan.pattern[(size_t)offset_from_match].wildcard;
+                bool was_at_wildcard = offset_from_match < size && pattern[(size_t)offset_from_match].wildcard;
                 bool found = false;
                 while (offset_from_match < size && !found) {
-                    const bool is_wildcard = scan.pattern[(size_t)offset_from_match].wildcard;
+                    const bool is_wildcard = pattern[(size_t)offset_from_match].wildcard;
                     found = !was_at_wildcard && is_wildcard;
                     if (!found) {
                         was_at_wildcard = was_at_wildcard && is_wildcard;
@@ -395,6 +477,19 @@ Image::Walk Image::walk(const PatternScan& scan, uint32_t site, bool explain) co
 
 std::string Image::describe(int64_t rva) const { return hex(preferred_base + rva); }
 
+template <typename Scan>
+void* Image::firstLanding(const Scan& scan) const {
+    void* landed = nullptr;
+    visitSites(sitesOf(scan), [&](uint32_t site) {
+        const Walk walked = walk(patternOf(scan), stepsOf(scan), site, false);
+        if (walked.landed) {
+            landed = (void*)(live_base + *walked.landed);
+        }
+        return walked.landed.has_value();
+    });
+    return landed;
+}
+
 void* Image::scan(const PatternScan& scan) const {
     __try {
         return firstLanding(scan);
@@ -403,16 +498,12 @@ void* Image::scan(const PatternScan& scan) const {
     }
 }
 
-void* Image::firstLanding(const PatternScan& scan) const {
-    void* landed = nullptr;
-    visitSites(scan.pattern, [&](uint32_t site) {
-        const Walk walked = walk(scan, site, false);
-        if (walked.landed) {
-            landed = (void*)(live_base + *walked.landed);
-        }
-        return walked.landed.has_value();
-    });
-    return landed;
+void* Image::scan(const StringScan& scan) const {
+    __try {
+        return firstLanding(scan);
+    } __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return nullptr;
+    }
 }
 
 void* Image::scan(const FallbackScan& scans) const {
@@ -423,15 +514,20 @@ void* Image::scan(const FallbackScan& scans) const {
     return landed;
 }
 
-std::vector<Image::Site> Image::scanAll(const PatternScan& scan) const {
+template <typename Scan>
+std::vector<Image::Site> Image::allSites(const Scan& scan) const {
     std::vector<Site> sites;
-    visitSites(scan.pattern, [&](uint32_t site) {
-        Walk walked = walk(scan, site, true);
+    visitSites(sitesOf(scan), [&](uint32_t site) {
+        Walk walked = walk(patternOf(scan), stepsOf(scan), site, true);
         sites.push_back({live_base + site, walked.landed ? live_base + (uintptr_t)*walked.landed : 0, std::move(walked.rejected)});
         return false;
     });
     return sites;
 }
+
+std::vector<Image::Site> Image::scanAll(const PatternScan& scan) const { return allSites(scan); }
+
+std::vector<Image::Site> Image::scanAll(const StringScan& scan) const { return allSites(scan); }
 
 std::vector<uintptr_t> Image::findPattern(const Pattern& pattern) const {
     std::vector<uintptr_t> sites;

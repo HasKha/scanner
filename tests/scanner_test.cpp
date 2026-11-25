@@ -244,6 +244,28 @@ TEST_CASE("a scan lands where its steps take it") {
         CHECK(image.scan(PatternScan("B8 78 56 34 12", FuncEntry())) == (void*)at(0x1040));
         CHECK(image.scan(PatternScan("90 90 C3", FuncEntry())) == nullptr);
     }
+    SECTION("where a string is referred to") {
+        // The LEA's rel32 is the site.
+        CHECK(image.scan(StringScan("hello assert")) == (void*)at(0x1083));
+        CHECK(image.scan(StringScan("hello assert", Offset(-3), CmpI8(0x48))) == (void*)at(0x1080));
+        CHECK(image.scan(StringScan("other text", FuncEntry())) == (void*)at(0x1000));
+        CHECK(image.scan(StringScan(L"wide", FuncEntry())) == (void*)at(0x1040));
+        // On to the call after it.
+        CHECK(image.scan(StringScan("hello assert", Offset(5), Follow())) == (void*)at(0x1040));
+        // No pattern, so no wildcard to go to.
+        CHECK(image.scan(StringScan("hello assert", AdvWcard())) == (void*)at(0x1083));
+
+        const std::vector<Image::Site> sites = image.scanAll(StringScan("hello assert", FuncEntry()));
+        REQUIRE(sites.size() == 1);
+        CHECK(sites[0].match == at(0x1083));
+        CHECK(sites[0].rejected.find("in no function") != std::string::npos);
+
+        // The tail of a string is not a string the code refers to.
+        CHECK(image.scanAll(StringScan("text")).empty());
+        CHECK(image.scan(StringScan("not here")) == nullptr);
+        CHECK(image.scan(StringScan("")) == nullptr);
+        CHECK(image.scan(StringScan(L"")) == nullptr);
+    }
     SECTION("fallbacks, in turn") {
         const PatternScan missing("0F 0B");
         const PatternScan found("48 83 EC 28");
