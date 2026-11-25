@@ -9,13 +9,10 @@
 #include <vector>
 
 // What to look for in an executable's code: a byte pattern, and the steps that take a site it matches to the address
-// wanted. The grammar and the steps are memtools' (DeltaRaidcore/memtools, MIT), names included, so a signature
-// written for memtools is written for this: `PatternScan("48 8D 0D <? ? ? ?>", AdvWcard(), Follow())` reads the same
-// in either. The steps are types here, where memtools has functions, and are built the same way.
+// wanted, as `PatternScan("48 8D 0D <? ? ? ?>", AdvWcard(), Follow())`. The steps are types, so a scan is a constant.
 namespace scanner {
 
-// memtools kept the first 128 bytes of a longer pattern and dropped the rest without a word. Here a longer one is
-// malformed, which fails the build of a pattern made at compile time.
+// A longer pattern is malformed, which fails the build of one made at compile time.
 inline constexpr size_t MAX_PATTERN_SIZE = 256;
 inline constexpr size_t MAX_STEPS = 16;
 
@@ -28,9 +25,8 @@ struct PatternByte {
     uint8_t value = 0;
 };
 
-// A pattern as memtools writes it: a byte in hex, `?` or `??` for one that may be anything, and spaces, `<` and `>`
-// anywhere, ignored: the brackets mark the bytes that matter, for the reader. A hex digit with none after it is a byte
-// of its own, as in memtools. Lowercase is read too, which memtools refused.
+// A byte in hex, either case, `?` or `??` for one that may be anything, and spaces, `<` and `>` anywhere, ignored: the
+// brackets mark the bytes that matter, for the reader. A hex digit with none after it is a byte of its own.
 class Pattern {
 public:
     constexpr Pattern() = default;
@@ -152,8 +148,7 @@ struct PopAddr : Step {
 
 // Goes to the start of the `sets`th run of wildcards after this point in the pattern, counted from the site's start
 // plus every Offset() so far, whatever Follow() did since. A run is wildcards side by side, brackets or not: in
-// `8B 0D ? ? ? ? 85 <? ?>`, the second run starts at byte 7. With no run left it stops at the pattern's end. This is
-// memtools' walk, kept exactly, so that its signatures land where they did.
+// `8B 0D ? ? ? ? 85 <? ?>`, the second run starts at byte 7. With no run left it stops at the pattern's end.
 struct AdvWcard : Step {
     constexpr explicit AdvWcard(int64_t sets = 1) : Step{StepKind::AdvWcard, sets > 1 ? sets : 1} {}
 };

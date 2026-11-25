@@ -166,7 +166,7 @@ __declspec(noinline) int distinctiveFunction(int value) { return value * 0x5EED 
 
 } // namespace
 
-TEST_CASE("a pattern reads as memtools reads it") {
+TEST_CASE("a pattern reads its text") {
     constexpr Pattern PATTERN("48 ?? <? 8b> F 0a");
     static_assert(PATTERN.size() == 6 && PATTERN.valid());
     static_assert(!PATTERN[0].wildcard && PATTERN[0].value == 0x48);
@@ -183,7 +183,7 @@ TEST_CASE("a pattern reads as memtools reads it") {
     CHECK_FALSE(Pattern("").valid());
 }
 
-TEST_CASE("a scan lands where memtools lands") {
+TEST_CASE("a scan lands where its steps take it") {
     const Image image = openExe();
 
     SECTION("the pattern alone") {

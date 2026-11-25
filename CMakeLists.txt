@@ -10,15 +10,13 @@ add_library(scanner STATIC
 target_include_directories(scanner PUBLIC "include/")
 target_compile_features(scanner PUBLIC cxx_std_20)
 
-# Under a parent, the parent's Catch2, configured once for the whole build.
-if(PROJECT_IS_TOP_LEVEL)
-    include(FetchContent)
-    FetchContent_Declare(catch2 GIT_REPOSITORY https://github.com/catchorg/Catch2.git GIT_TAG v3.8.1 GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(catch2)
-    enable_testing()
-else()
-    include(catch2)
+# Off under a parent unless it asks, so a project that only links the scanner needs no Catch2.
+option(SCANNER_BUILD_TESTS "Build scanner_tests" ${PROJECT_IS_TOP_LEVEL})
+if(SCANNER_BUILD_TESTS)
+    # Appended, so a parent's own cmake/catch2.cmake comes first, and Catch2 is configured once, its way.
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    if(PROJECT_IS_TOP_LEVEL)
+        enable_testing()
+    endif()
+    add_subdirectory(tests)
 endif()
-add_executable(scanner_tests "tests/scanner_test.cpp")
-target_link_libraries(scanner_tests PRIVATE scanner Catch2::Catch2WithMain)
-add_test(NAME scanner_tests COMMAND scanner_tests)

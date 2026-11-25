@@ -39,7 +39,7 @@ public:
 
     // ---- Scanning
 
-    // Where `scan` lands from its lowest site whose steps can all be taken, as memtools takes it. Null when none can.
+    // Where `scan` lands from its lowest site whose steps can all be taken. Null when none can.
     void* scan(const PatternScan& scan) const;
     // The first of the scans that lands anywhere, where it lands.
     void* scan(const FallbackScan& scans) const;
